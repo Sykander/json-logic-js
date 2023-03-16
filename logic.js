@@ -1,4 +1,7 @@
 /* globals define,module */
+
+const { asyncFilter, asyncMap, asyncReduce } = require("iterable-async");
+
 /*
 Using a Universal Module Loader that should be browser, require, and AMD friendly
 http://ricostacruz.com/cheatsheets/umdjs.html
@@ -381,6 +384,166 @@ http://ricostacruz.com/cheatsheets/umdjs.html
 
     throw new Error("Unrecognized operation " + op );
   };
+
+  jsonLogic.async_apply = async function(logic, data) {
+    // Does this array contain logic? Only one way to find out.
+    if (Array.isArray(logic)) {
+      return Promise.all(logic.map(function(l) {
+        return jsonLogic.async_apply(l, data);
+      }));
+    }
+    // You've recursed to a primitive, stop!
+    if ( ! jsonLogic.is_logic(logic) ) {
+      return logic;
+    }
+
+    var op = jsonLogic.get_operator(logic);
+    var values = logic[op];
+    var i;
+    var current;
+    var scopedLogic;
+    var scopedData;
+    var initial;
+
+    // easy syntax for unary operators, like {"var" : "x"} instead of strict {"var" : ["x"]}
+    if ( ! Array.isArray(values)) {
+      values = [values];
+    }
+
+    // 'if', 'and', and 'or' violate the normal rule of depth-first calculating consequents, let each manage recursion as needed.
+    if (op === "if" || op == "?:") {
+      /* 'if' should be called with a odd number of parameters, 3 or greater
+      This works on the pattern:
+      if( 0 ){ 1 }else{ 2 };
+      if( 0 ){ 1 }else if( 2 ){ 3 }else{ 4 };
+      if( 0 ){ 1 }else if( 2 ){ 3 }else if( 4 ){ 5 }else{ 6 };
+
+      The implementation is:
+      For pairs of values (0,1 then 2,3 then 4,5 etc)
+      If the first evaluates truthy, evaluate and return the second
+      If the first evaluates falsy, jump to the next pair (e.g, 0,1 to 2,3)
+      given one parameter, evaluate and return it. (it's an Else and all the If/ElseIf were false)
+      given 0 parameters, return NULL (not great practice, but there was no Else)
+      */
+      for (i = 0; i < values.length - 1; i += 2) {
+        if ( jsonLogic.truthy( await jsonLogic.apply(values[i], data) ) ) {
+          return jsonLogic.async_apply(values[i+1], data);
+        }
+      }
+      if (values.length === i+1) {
+        return jsonLogic.async_apply(values[i], data);
+      }
+      return null;
+    } else if (op === "and") { // Return first falsy, or last
+      for (i=0; i < values.length; i+=1) {
+        current = await jsonLogic.async_apply(values[i], data);
+        if ( ! jsonLogic.truthy(current)) {
+          return current;
+        }
+      }
+      return current; // Last
+    } else if (op === "or") {// Return first truthy, or last
+      for (i=0; i < values.length; i+=1) {
+        current = await jsonLogic.async_apply(values[i], data);
+        if ( jsonLogic.truthy(current) ) {
+          return current;
+        }
+      }
+      return current; // Last
+    } else if (op === "filter") {
+      scopedData = await jsonLogic.async_apply(values[0], data);
+      scopedLogic = values[1];
+
+      if ( ! Array.isArray(scopedData)) {
+        return [];
+      }
+      // Return only the elements from the array in the first argument,
+      // that return truthy when passed to the logic in the second argument.
+      // For parity with JavaScript, reindex the returned array
+      return asyncFilter(scopedData, async (datum) => jsonLogic.truthy( await jsonLogic.async_apply(scopedLogic, datum) ));
+    } else if (op === "map") {
+      scopedData = await jsonLogic.async_apply(values[0], data);
+      scopedLogic = values[1];
+
+      if ( ! Array.isArray(scopedData)) {
+        return [];
+      }
+
+      return asyncMap(scopedData, datum => jsonLogic.async_apply(scopedLogic, datum));
+    } else if (op === "reduce") {
+      scopedData = await jsonLogic.async_apply(values[0], data);
+      scopedLogic = values[1];
+      initial = typeof values[2] !== "undefined" ? values[2] : null;
+
+      return asyncReduce(scopedData, (accumulator, current) => jsonLogic.async_apply(scopedLogic, { current, accumulator }), initial);
+    } else if (op === "all") {
+      scopedData = await jsonLogic.async_apply(values[0], data);
+      scopedLogic = values[1];
+      // All of an empty set is false. Note, some and none have correct fallback after the for loop
+      if ( ! Array.isArray(scopedData) || ! scopedData.length) {
+        return false;
+      }
+      for (i=0; i < scopedData.length; i+=1) {
+        if ( ! jsonLogic.truthy( await jsonLogic.async_apply(scopedLogic, scopedData[i]) )) {
+          return false; // First falsy, short circuit
+        }
+      }
+      return true; // All were truthy
+    } else if (op === "none") {
+      scopedData = await jsonLogic.async_apply(values[0], data);
+      scopedLogic = values[1];
+
+      if ( ! Array.isArray(scopedData) || ! scopedData.length) {
+        return true;
+      }
+      for (i=0; i < scopedData.length; i+=1) {
+        if ( jsonLogic.truthy( await jsonLogic.async_apply(scopedLogic, scopedData[i]) )) {
+          return false; // First truthy, short circuit
+        }
+      }
+      return true; // None were truthy
+    } else if (op === "some") {
+      scopedData = await jsonLogic.async_apply(values[0], data);
+      scopedLogic = values[1];
+
+      if ( ! Array.isArray(scopedData) || ! scopedData.length) {
+        return false;
+      }
+      for (i=0; i < scopedData.length; i+=1) {
+        if ( jsonLogic.truthy( await jsonLogic.async_apply(scopedLogic, scopedData[i]) )) {
+          return true; // First truthy, short circuit
+        }
+      }
+      return false; // None were truthy
+    } else if (runOperationAsControlled[op]) {
+      return await operations[op](values, data, jsonLogic);
+    }
+
+    // Everyone else gets immediate depth-first recursion
+    values = await Promise.all(values.map(val => jsonLogic.async_apply(val, data)));
+
+    // The operation is called with "data" bound to its "this" and "values" passed as arguments.
+    // Structured commands like % or > can name formal arguments while flexible commands (like missing or merge) can operate on the pseudo-array arguments
+    // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Functions/arguments
+    if (operations.hasOwnProperty(op) && typeof operations[op] === "function") {
+      return operations[op].apply(data, values);
+    } else if (op.indexOf(".") > 0) { // Contains a dot, and not in the 0th position
+      var sub_ops = String(op).split(".");
+      var operation = operations;
+      for (i = 0; i < sub_ops.length; i++) {
+        if (!operation.hasOwnProperty(sub_ops[i])) {
+          throw new Error("Unrecognized operation " + op +
+            " (failed at " + sub_ops.slice(0, i+1).join(".") + ")");
+        }
+        // Descending into operations
+        operation = operation[sub_ops[i]];
+      }
+
+      return operation.apply(data, values);
+    }
+
+    throw new Error("Unrecognized operation " + op );
+  }
 
   jsonLogic.uses_data = function(logic) {
     var collection = [];

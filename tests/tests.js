@@ -129,7 +129,6 @@ QUnit.module('basic', () => {
     );
   });
 
-
   QUnit.test( "logging", function( assert ) {
     var last_console;
     console.log = function(logged) {
